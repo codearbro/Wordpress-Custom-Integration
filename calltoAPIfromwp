@@ -1,0 +1,182 @@
+/*
+ * Contact Form 7 to Zoho CRM Integration (FULLY WORKING VERSION)
+ * Last Tested: May 2024
+ * Features:
+ * - Uses reliable wpcf7_before_send_mail hook
+ * - Smart field mapping with fallbacks
+ * - Automatic token refresh
+ * - Detailed error logging
+ */
+
+// ========================
+// MAIN INTEGRATION HOOK
+// ========================
+add_action('wpcf7_before_send_mail', 'send_cf7_data_to_zoho_crm');
+
+function send_cf7_data_to_zoho_crm($contact_form) {
+    error_log('[CF7->ZOHO] === START PROCESSING ===');
+    
+    // Get submission data
+    $submission = WPCF7_Submission::get_instance();
+    if (!$submission) {
+        error_log('[CF7->ZOHO] ERROR: No submission data found!');
+        return;
+    }
+
+    $form_data = $submission->get_posted_data();
+    $form_id = $contact_form->id();
+    
+    error_log("[CF7->ZOHO] Form ID: {$form_id}");
+    error_log('[CF7->ZOHO] All Fields: ' . print_r(array_keys($form_data), true));
+    
+    // Clean empty fields
+    $cleaned_data = array_filter($form_data, function($value) {
+        return !empty($value);
+    });
+
+    // Send to Zoho
+    $result = create_zoho_lead($cleaned_data, $form_id);
+    
+    if ($result) {
+        error_log('[CF7->ZOHO] Successfully sent to Zoho CRM');
+    } else {
+        error_log('[CF7->ZOHO] Failed to send to Zoho CRM');
+    }
+}
+
+// ========================
+// ZOHO CRM LEAD CREATION
+// ========================
+function create_zoho_lead($form_data, $form_id) {
+    error_log('[CF7->ZOHO] Preparing Zoho lead...');
+    
+    // 1. Get valid access token
+    $access_token = get_current_zoho_token();
+    if (!$access_token) {
+        error_log('[CF7->ZOHO] ERROR: No valid access token');
+        return false;
+    }
+
+    // 2. Map form fields to Zoho fields
+    $lead_data = [
+        'Last_Name'    => !empty($form_data['your-name']) ? $form_data['your-name'] : 'Website Lead',
+        'First_Name'   => !empty($form_data['first-name']) ? $form_data['first-name'] : '',
+        'Email'        => !empty($form_data['your-email']) ? $form_data['your-email'] : '',
+        'Phone'        => !empty($form_data['your-phone']) ? $form_data['your-phone'] : '',
+        'Company'      => !empty($form_data['your-company']) ? $form_data['your-company'] : 'Not Specified',
+        'Description'  => !empty($form_data['your-message']) ? $form_data['your-message'] : '',
+        'Lead_Source'  => 'Website',
+        'Lead_Status' => 'New'
+    ];
+
+    // 3. API Request
+    $api_url = 'https://www.zohoapis.eu/crm/v7/Leads';
+    $args = [
+        'headers' => [
+            'Authorization' => 'Zoho-oauthtoken ' . $access_token,
+            'Content-Type' => 'application/json',
+        ],
+        'body' => json_encode(['data' => [$lead_data]]),
+        'timeout' => 30
+    ];
+
+    error_log('[CF7->ZOHO] Sending to Zoho: ' . json_encode($lead_data));
+    
+    $response = wp_remote_post($api_url, $args);
+    
+    // 4. Handle response
+    if (is_wp_error($response)) {
+        error_log('[CF7->ZOHO] WordPress error: ' . $response->get_error_message());
+        return false;
+    }
+
+    $status_code = wp_remote_retrieve_response_code($response);
+    $body = wp_remote_retrieve_body($response);
+    
+    error_log("[CF7->ZOHO] Response {$status_code}: " . $body);
+
+    return ($status_code == 201);
+}
+
+// ========================
+// OAUTH TOKEN MANAGEMENT
+// ========================
+function get_current_zoho_token() {
+    $token_data = get_option('zoho_crm_token_data');
+    
+    // Return valid token if exists
+    if ($token_data && isset($token_data['access_token']) && 
+        time() < ($token_data['expires_at'] - 300)) {
+        return $token_data['access_token'];
+    }
+    
+    // Otherwise refresh
+    return refresh_zoho_token();
+}
+
+function refresh_zoho_token() {
+    $credentials = [
+        'refresh_token' => '1000.25270f49ba8f43765fec565d8154b78f.504830a8dd08b450092ab73bae4d0e76',
+        'client_id'     => '1000.5SV4K8WBUTN1XQK8LEVR124YOM8EAI',
+        'client_secret' => 'fd3552b03eb19e49b25a8f1119ce173db906fe9c9c'
+    ];
+    
+    $response = wp_remote_post('https://accounts.zoho.eu/oauth/v2/token', [
+        'body' => [
+            'refresh_token' => $credentials['refresh_token'],
+            'client_id'     => $credentials['client_id'],
+            'client_secret' => $credentials['client_secret'],
+            'grant_type'    => 'refresh_token'
+        ]
+    ]);
+
+    if (!is_wp_error($response) && 200 === wp_remote_retrieve_response_code($response)) {
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+        
+        update_option('zoho_crm_token_data', [
+            'access_token' => $body['access_token'],
+            'expires_at'  => time() + 3600
+        ]);
+        
+        return $body['access_token'];
+    }
+    
+    error_log('[CF7->ZOHO] Token refresh failed!');
+    return false;
+}
+
+// ========================
+// ADMIN DEBUG PAGE
+// ========================
+add_action('admin_menu', 'zoho_crm_debug_menu');
+
+function zoho_crm_debug_menu() {
+    add_options_page(
+        'Zoho CRM Debug',
+        'Zoho CRM Debug',
+        'manage_options',
+        'zoho-crm-debug',
+        'zoho_crm_debug_page'
+    );
+}
+
+function zoho_crm_debug_page() {
+    echo '<div class="wrap"><h1>Zoho CRM Debug</h1>';
+    
+    if (isset($_POST['test_connection'])) {
+        $token = refresh_zoho_token();
+        echo $token 
+            ? '<div class="notice notice-success"><p>✅ Success! Token: ' . substr($token, 0, 15) . '...</p></div>'
+            : '<div class="notice notice-error"><p>❌ Connection failed. Check error logs.</p></div>';
+    }
+    
+    // Token status
+    $token_data = get_option('zoho_crm_token_data');
+    echo '<h3>Current Token Status</h3>';
+    echo '<pre>' . print_r($token_data, true) . '</pre>';
+    
+    // Test form
+    echo '<form method="post"><input type="submit" name="test_connection" value="Test Connection" class="button button-primary"></form>';
+    echo '</div>';
+}
+
